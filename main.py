@@ -5,6 +5,8 @@ import asyncio
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -16,7 +18,7 @@ from mcp.client.stdio import stdio_client
 
 LLAMA_URL = os.environ.get(
     "LLAMA_URL",
-    "http://localhost-0:8080/v1/chat/completions",
+    "http://127.0.0.1:8080/v1/chat/completions",
 )
 
 WORKSPACE = str(
@@ -154,42 +156,106 @@ def mcp_tools_to_openai(
 def custom_tools() -> list[dict[str, Any]]:
     """Tools implemented directly by this bridge."""
 
-    return [
-        {
+    def tool(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
+        return {
             "type": "function",
             "function": {
-                "name": "find_main_program",
-                "description": (
-                    "Find likely program entry-point files in a software "
-                    "project. Supports C, C++, Python, JavaScript, TypeScript, "
-                    "Java, Go, Rust, C#, Kotlin and shell projects. It searches "
-                    "for main functions, Python __main__ blocks and common "
-                    "entry-point filenames."
-                ),
+                "name": name,
+                "description": description,
                 "parameters": {
                     "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": (
-                                "Absolute project directory inside the allowed "
-                                "workspace."
-                            ),
-                        },
-                        "max_results": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 50,
-                            "default": 15,
-                        },
-                    },
-                    "required": ["path"],
+                    "properties": properties,
+                    "required": required,
                     "additionalProperties": False,
                 },
             },
         }
-    ]
 
+    path_property = {
+        "type": "string",
+        "description": "Absolute path inside the allowed workspace.",
+    }
+
+    return [
+        tool(
+            "find_main_program",
+            "Find likely program entry-point files in a software project.",
+            {
+                "path": path_property,
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 50, "default": 15},
+            },
+            ["path"],
+        ),
+        tool(
+            "read_lines",
+            "Read an inclusive range of lines from a text file and return numbered lines.",
+            {
+                "path": path_property,
+                "start_line": {"type": "integer", "minimum": 1},
+                "end_line": {"type": "integer", "minimum": 1},
+            },
+            ["path", "start_line", "end_line"],
+        ),
+        tool(
+            "list_symbols",
+            "List likely classes, structs, namespaces and functions declared in a source file.",
+            {"path": path_property},
+            ["path"],
+        ),
+        tool(
+            "find_definition",
+            "Find likely definitions or declarations of a symbol in the workspace.",
+            {
+                "symbol": {"type": "string"},
+                "path": path_property,
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+            },
+            ["symbol"],
+        ),
+        tool(
+            "find_references",
+            "Find textual references to a symbol in source files in the workspace.",
+            {
+                "symbol": {"type": "string"},
+                "path": path_property,
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+            },
+            ["symbol"],
+        ),
+        tool(
+            "find_corresponding_header",
+            "Find likely header files corresponding to a C or C++ source file.",
+            {"path": path_property},
+            ["path"],
+        ),
+        tool(
+            "find_corresponding_source",
+            "Find likely C or C++ source files corresponding to a header file.",
+            {"path": path_property},
+            ["path"],
+        ),
+        tool(
+            "extract_containing_function",
+            "Extract the function or method containing a given 1-based source line.",
+            {
+                "path": path_property,
+                "line": {"type": "integer", "minimum": 1},
+            },
+            ["path", "line"],
+        ),
+        tool(
+            "run_clang_tidy",
+            "Run clang-tidy on a C or C++ source file and return diagnostics.",
+            {
+                "path": path_property,
+                "build_path": path_property,
+                "checks": {"type": "string", "default": ""},
+                "fix": {"type": "boolean", "default": False},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 1800, "default": 300},
+            },
+            ["path"],
+        ),
+    ]
 
 def parse_tool_arguments(arguments: Any) -> dict[str, Any]:
     if arguments is None:
@@ -734,6 +800,243 @@ def find_main_program(arguments: dict[str, Any]) -> str:
     )
 
 
+
+def _json(data: Any) -> str:
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def _resolve_allowed_path(value: Any, default: str | None = None) -> Path:
+    if value is None:
+        value = default if default is not None else WORKSPACE
+    if not isinstance(value, str):
+        raise ValueError("path must be a string")
+    path = Path(value).expanduser().resolve()
+    if not is_path_allowed(str(path)):
+        raise ValueError(f"path is outside allowed workspace: {path}")
+    return path
+
+
+def _iter_source_files(root: Path):
+    if root.is_file():
+        if root.suffix.lower() in SOURCE_EXTENSIONS:
+            yield root
+        return
+    for current_root, directories, files in os.walk(root):
+        directories[:] = [d for d in directories if d not in EXCLUDED_DIRECTORIES]
+        for name in files:
+            path = Path(current_root) / name
+            if path.suffix.lower() in SOURCE_EXTENSIONS:
+                yield path
+
+
+def read_lines_tool(arguments: dict[str, Any]) -> str:
+    try:
+        path = _resolve_allowed_path(arguments.get("path"))
+        start = int(arguments.get("start_line"))
+        end = int(arguments.get("end_line"))
+        if start < 1 or end < start:
+            raise ValueError("require 1 <= start_line <= end_line")
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        selected = [f"{i:6d}: {lines[i-1]}" for i in range(start, min(end, len(lines)) + 1)]
+        return _json({"path": str(path), "start_line": start, "end_line": min(end, len(lines)), "total_lines": len(lines), "text": "\n".join(selected)})
+    except Exception as error:
+        return _json({"error": str(error)})
+
+
+def list_symbols_tool(arguments: dict[str, Any]) -> str:
+    try:
+        path = _resolve_allowed_path(arguments.get("path"))
+        text = path.read_text(encoding="utf-8", errors="replace")
+        symbols: list[dict[str, Any]] = []
+        patterns = [
+            ("namespace", re.compile(r"^\s*namespace\s+([A-Za-z_]\w*)", re.M)),
+            ("class", re.compile(r"^\s*(?:template\s*<[^;{]+>\s*)?(class|struct|enum(?:\s+class)?)\s+([A-Za-z_]\w*)", re.M)),
+            ("function", re.compile(r"^\s*(?:template\s*<[^;{]+>\s*)?(?:[\w:\<\>\*&\s]+?)\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*\([^;{}]*\)\s*(?:const\s*)?(?:noexcept(?:\([^)]*\))?\s*)?(?:->\s*[^\{]+)?\s*\{", re.M)),
+            ("python_function", re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(", re.M)),
+            ("python_class", re.compile(r"^\s*class\s+([A-Za-z_]\w*)\s*(?:\(|:)", re.M)),
+        ]
+        for kind, pattern in patterns:
+            for match in pattern.finditer(text):
+                name = match.group(2) if kind == "class" else match.group(1)
+                line = text.count("\n", 0, match.start()) + 1
+                symbols.append({"name": name, "kind": kind, "line": line})
+        symbols.sort(key=lambda x: (x["line"], x["name"]))
+        return _json({"path": str(path), "symbols": symbols})
+    except Exception as error:
+        return _json({"error": str(error)})
+
+
+def _search_symbol(symbol: str, root: Path, max_results: int, definitions_only: bool) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    escaped = re.escape(symbol)
+    if definitions_only:
+        regex = re.compile(rf"(?:\bclass\s+|\bstruct\s+|\benum(?:\s+class)?\s+|\bdef\s+|\bfn\s+|\bfunc\s+|\b(?:[\w:<>,~*&]+\s+)+){escaped}\s*(?:\(|\{{|:)")
+    else:
+        regex = re.compile(rf"\b{escaped}\b")
+    for path in _iter_source_files(root):
+        content = read_small_text_file(path)
+        if content is None:
+            continue
+        for line_no, line in enumerate(content.splitlines(), 1):
+            if regex.search(line):
+                results.append({"path": str(path), "line": line_no, "text": line.strip()})
+                if len(results) >= max_results:
+                    return results
+    return results
+
+
+def find_definition_tool(arguments: dict[str, Any]) -> str:
+    try:
+        symbol = arguments.get("symbol")
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise ValueError("symbol must be a non-empty string")
+        root = _resolve_allowed_path(arguments.get("path"), WORKSPACE)
+        limit = max(1, min(int(arguments.get("max_results", 20)), 100))
+        return _json({"symbol": symbol, "results": _search_symbol(symbol, root, limit, True)})
+    except Exception as error:
+        return _json({"error": str(error)})
+
+
+def find_references_tool(arguments: dict[str, Any]) -> str:
+    try:
+        symbol = arguments.get("symbol")
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise ValueError("symbol must be a non-empty string")
+        root = _resolve_allowed_path(arguments.get("path"), WORKSPACE)
+        limit = max(1, min(int(arguments.get("max_results", 100)), 500))
+        return _json({"symbol": symbol, "results": _search_symbol(symbol, root, limit, False)})
+    except Exception as error:
+        return _json({"error": str(error)})
+
+
+def _counterpart_candidates(path: Path, extensions: tuple[str, ...]) -> list[dict[str, Any]]:
+    stem = path.stem
+    candidates: list[Path] = []
+    preferred_dirs = [path.parent, Path(WORKSPACE) / "include", Path(WORKSPACE) / "src"]
+    for directory in preferred_dirs:
+        for ext in extensions:
+            candidate = directory / f"{stem}{ext}"
+            if candidate.exists() and candidate.resolve() != path.resolve():
+                candidates.append(candidate.resolve())
+    for candidate in Path(WORKSPACE).rglob(f"{stem}.*"):
+        if any(part in EXCLUDED_DIRECTORIES for part in candidate.parts):
+            continue
+        if candidate.suffix.lower() in extensions and candidate.resolve() != path.resolve():
+            candidates.append(candidate.resolve())
+    unique=[]; seen=set()
+    for candidate in candidates:
+        key=str(candidate)
+        if key not in seen:
+            seen.add(key); unique.append({"path": key, "relative_path": str(candidate.relative_to(Path(WORKSPACE)))})
+    return unique
+
+
+def find_corresponding_header_tool(arguments: dict[str, Any]) -> str:
+    try:
+        path = _resolve_allowed_path(arguments.get("path"))
+        return _json({"source": str(path), "headers": _counterpart_candidates(path, (".h", ".hh", ".hpp", ".hxx"))})
+    except Exception as error:
+        return _json({"error": str(error)})
+
+
+def find_corresponding_source_tool(arguments: dict[str, Any]) -> str:
+    try:
+        path = _resolve_allowed_path(arguments.get("path"))
+        return _json({"header": str(path), "sources": _counterpart_candidates(path, (".c", ".cc", ".cpp", ".cxx"))})
+    except Exception as error:
+        return _json({"error": str(error)})
+
+
+def _brace_matching_end(text: str, opening: int) -> int | None:
+    depth=0; state="code"; i=opening
+    while i < len(text):
+        c=text[i]; n=text[i+1] if i+1 < len(text) else ""
+        if state == "code":
+            if c == '"': state="string"
+            elif c == "'": state="char"
+            elif c == "/" and n == "/": state="line_comment"; i += 1
+            elif c == "/" and n == "*": state="block_comment"; i += 1
+            elif c == "{": depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0: return i
+        elif state == "string":
+            if c == "\\": i += 1
+            elif c == '"': state="code"
+        elif state == "char":
+            if c == "\\": i += 1
+            elif c == "'": state="code"
+        elif state == "line_comment":
+            if c == "\n": state="code"
+        elif state == "block_comment":
+            if c == "*" and n == "/": state="code"; i += 1
+        i += 1
+    return None
+
+
+def extract_containing_function_tool(arguments: dict[str, Any]) -> str:
+    try:
+        path = _resolve_allowed_path(arguments.get("path"))
+        target_line = int(arguments.get("line"))
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if target_line < 1 or target_line > text.count("\n") + 1:
+            raise ValueError("line is outside file")
+        function_pattern = re.compile(r"(?m)^[ \t]*(?:template\s*<[^;{]+>\s*)?(?:[\w:\<\>\*&\[\],~]+[ \t]+)+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*\([^;{}]*\)\s*(?:const\s*)?(?:noexcept(?:\([^)]*\))?\s*)?(?:->\s*[^\{]+)?\s*\{")
+        candidates=[]
+        for match in function_pattern.finditer(text):
+            opening=text.find("{", match.start(), match.end())
+            end=_brace_matching_end(text, opening)
+            if end is None: continue
+            start_line=text.count("\n", 0, match.start())+1
+            end_line=text.count("\n", 0, end)+1
+            if start_line <= target_line <= end_line:
+                candidates.append((start_line, end_line, match.group(1), match.start(), end+1))
+        if not candidates:
+            return _json({"path": str(path), "line": target_line, "found": False})
+        start_line,end_line,name,start_pos,end_pos=max(candidates, key=lambda c:c[0])
+        return _json({"path": str(path), "line": target_line, "found": True, "symbol": name, "start_line": start_line, "end_line": end_line, "code": text[start_pos:end_pos]})
+    except Exception as error:
+        return _json({"error": str(error)})
+
+
+def _find_compile_db(start: Path) -> Path | None:
+    for candidate in [start, *start.parents]:
+        direct=candidate / "compile_commands.json"
+        build=candidate / "build" / "compile_commands.json"
+        if direct.exists(): return candidate
+        if build.exists(): return candidate / "build"
+        if candidate == Path(WORKSPACE): break
+    for path in Path(WORKSPACE).rglob("compile_commands.json"):
+        if not any(part in EXCLUDED_DIRECTORIES - {"build", "cmake-build-debug", "cmake-build-release"} for part in path.parts):
+            return path.parent
+    return None
+
+
+def run_clang_tidy_tool(arguments: dict[str, Any]) -> str:
+    try:
+        executable=shutil.which("clang-tidy")
+        if executable is None:
+            raise ValueError("clang-tidy is not installed or not in PATH")
+        path=_resolve_allowed_path(arguments.get("path"))
+        if path.suffix.lower() not in {".c", ".cc", ".cpp", ".cxx"}:
+            raise ValueError("clang-tidy should be run on a C/C++ source file")
+        build_value=arguments.get("build_path")
+        build_path=_resolve_allowed_path(build_value) if build_value else _find_compile_db(path.parent)
+        if build_path is None:
+            raise ValueError("compile_commands.json not found; configure CMake with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON")
+        checks=arguments.get("checks", "")
+        fix=bool(arguments.get("fix", False))
+        timeout=max(1, min(int(arguments.get("timeout_seconds", 300)), 1800))
+        command=[executable, str(path), "-p", str(build_path)]
+        if isinstance(checks, str) and checks: command.append(f"-checks={checks}")
+        if fix: command.append("--fix")
+        completed=subprocess.run(command, cwd=WORKSPACE, capture_output=True, text=True, timeout=timeout, check=False)
+        return _json({"command": command, "returncode": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "build_path": str(build_path)})
+    except subprocess.TimeoutExpired as error:
+        return _json({"error": f"clang-tidy timed out after {error.timeout} seconds"})
+    except Exception as error:
+        return _json({"error": str(error)})
+
 def parse_temperature(value: str) -> float:
     try:
         parsed = float(value)
@@ -853,8 +1156,19 @@ async def execute_tool(
     tool_name: str,
     arguments: dict[str, Any],
 ) -> str:
-    if tool_name == "find_main_program":
-        return find_main_program(arguments)
+    custom_dispatch = {
+        "find_main_program": find_main_program,
+        "read_lines": read_lines_tool,
+        "list_symbols": list_symbols_tool,
+        "find_definition": find_definition_tool,
+        "find_references": find_references_tool,
+        "find_corresponding_header": find_corresponding_header_tool,
+        "find_corresponding_source": find_corresponding_source_tool,
+        "extract_containing_function": extract_containing_function_tool,
+        "run_clang_tidy": run_clang_tidy_tool,
+    }
+    if tool_name in custom_dispatch:
+        return custom_dispatch[tool_name](arguments)
 
     try:
         result = await session.call_tool(
@@ -904,6 +1218,9 @@ async def run_agent(
         f"The only allowed filesystem root is `{WORKSPACE}`. "
         "Always use that exact absolute path or a path below it. "
         "Never use `/` as a filesystem path. "
+        "Use code-intelligence tools such as read_lines, list_symbols, "
+        "find_definition, find_references, corresponding-file lookup, "
+        "extract_containing_function and run_clang_tidy when appropriate. "
         "When the user asks for the main program, application entry point, "
         "startup file or file containing main(), always call "
         "`find_main_program`. Do not guess programming languages or search "
