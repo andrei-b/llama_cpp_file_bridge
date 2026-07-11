@@ -30,7 +30,10 @@ pip install -r requirements.txt
 Optional environment variables:
 
 - `LLAMA_URL` (default: `http://127.0.0.1:8080/v1/chat/completions`)
-- `MCP_WORKSPACE` (default in code: `/home/abagx/mcp-workspace`)
+- `MCP_WORKSPACE` (used as default for `--workspace`)
+- `LLAMA_MODEL` (used as default for `--model`)
+- `LLAMA_TEMPERATURE` (used as default for `--temperature`)
+- `LLAMA_MAX_TOKENS` (used as default for `--max-tokens`)
 
 Example:
 
@@ -43,6 +46,16 @@ export MCP_WORKSPACE="/home/andrei/CLionProjects/file_agent"
 
 ```bash
 python3 main.py
+```
+
+You can override runtime settings with CLI arguments:
+
+```bash
+python3 main.py \
+  --workspace "/home/andrei/CLionProjects/file_agent" \
+  --model "qwen2.5-coder" \
+  --temperature 0.1 \
+  --max-tokens 3000
 ```
 
 Type your request at the prompt. Use `exit` or `quit` to stop.
