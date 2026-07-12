@@ -1,0 +1,3 @@
+build/
+clang-llm-report.jsonl
+.cache/
